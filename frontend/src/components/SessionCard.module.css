@@ -1,0 +1,172 @@
+.card {
+  background: white;
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 15px;
+}
+
+.sessionIdRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sessionId {
+  font-weight: 600;
+  color: #333;
+  font-size: 16px;
+}
+
+.copyBtn {
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid #e1e8ed;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.copyBtn:hover {
+  background: #f8f9fa;
+  border-color: #667eea;
+}
+
+.statusBadge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.statusConnected {
+  background: #d4edda;
+  color: #155724;
+}
+
+.statusConnecting {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.statusDisconnected {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.statusQrRequired {
+  background: #cce5ff;
+  color: #004085;
+}
+
+.phoneNumber {
+  margin: 10px 0;
+  color: #666;
+  font-size: 14px;
+}
+
+.qrCode {
+  margin: 15px 0;
+  text-align: center;
+}
+
+.qrCode img {
+  max-width: 100%;
+  height: auto;
+  border: 2px solid #e1e8ed;
+  border-radius: 8px;
+  padding: 10px;
+  background: white;
+}
+
+.qrHelp {
+  color: #666;
+  font-size: 13px;
+  margin-top: 10px;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-top: 15px;
+}
+
+.btnPrimary,
+.btnSecondary,
+.btnWarning,
+.btnDanger {
+  padding: 10px 14px;
+  border: 2px solid;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btnPrimary {
+  background: #667eea;
+  border-color: #667eea;
+  color: white;
+}
+
+.btnPrimary:hover:not(:disabled) {
+  background: #5568d3;
+  border-color: #5568d3;
+}
+
+.btnSecondary {
+  background: white;
+  border-color: #e1e8ed;
+  color: #333;
+}
+
+.btnSecondary:hover:not(:disabled) {
+  background: #f8f9fa;
+  border-color: #667eea;
+}
+
+.btnWarning {
+  background: #f59e0b;
+  border-color: #f59e0b;
+  color: white;
+}
+
+.btnWarning:hover:not(:disabled) {
+  background: #d97706;
+  border-color: #d97706;
+}
+
+.btnDanger {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: white;
+}
+
+.btnDanger:hover:not(:disabled) {
+  background: #dc2626;
+  border-color: #dc2626;
+}
+
+.btnPrimary:disabled,
+.btnSecondary:disabled,
+.btnWarning:disabled,
+.btnDanger:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  .actions {
+    grid-template-columns: 1fr;
+  }
+}

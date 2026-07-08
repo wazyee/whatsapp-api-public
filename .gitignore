@@ -1,0 +1,46 @@
+.DS_Store
+.env
+.yarn/
+*.tgz
+*/.DS_Store
+auth_info*.json
+baileys_auth_info*
+baileys_store*.json
+browser-messages.json
+browser-token.json
+decoded-ws.json
+docs
+lib
+messages*.json
+node_modules
+output.csv
+Proxy
+test.ts
+TestData
+wa-logs.txt
+
+# Build output
+dist/
+
+# Logs
+logs/
+*.log
+
+# Uploads and temp files
+uploads/
+temp/
+
+# Deployment documentation (contains credentials)
+DEPLOYMENT_SUCCESS.md
+SETUP_INSTRUCTIONS.md
+
+# PM2
+.pm2/
+
+# Frontend
+frontend/dist/
+frontend/node_modules/
+frontend/.vite/
+# live WhatsApp credentials — must never be in git
+auth_sessions/
+*.bak.*
