@@ -71,10 +71,41 @@ const upload = multer({
 router.get('/:sessionId', [
   param('sessionId').notEmpty(),
   query('limit').optional().isInt({ min: 1, max: 100 }),
-  query('offset').optional().isInt({ min: 0 })
+  query('offset').optional().isInt({ min: 0 }),
+  query('since').optional().isString(),
+  query('cursor').optional().isString()
 ], sessionMiddleware, handleValidationErrors, asyncHandler(async (req, res) => {
   const { sessionId } = req.params;
-  const { chatId, limit = 50, offset = 0 } = req.query;
+  const { chatId, limit = 50, offset = 0, since, cursor } = req.query;
+
+  // since-mode: incremental sync cursor (new messages + status updates),
+  // oldest-first with stable id tiebreak. Mutually exclusive with offset.
+  if (since || cursor) {
+    const sinceDate = parseSince(since as string | undefined);
+    if (!sinceDate) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid since — use ISO 8601 or unix epoch (seconds or ms)',
+        timestamp: new Date().toISOString()
+      } as ApiResponse);
+    }
+
+    const take = parseInt(limit as string) || 100;
+    const messages = await dbService.getMessagesSince(
+      sessionId,
+      sinceDate,
+      chatId as string,
+      take,
+      cursor as string | undefined
+    );
+
+    return res.json({
+      success: true,
+      data: messages,
+      nextCursor: messages.length === take ? messages[messages.length - 1].id : null,
+      timestamp: new Date().toISOString()
+    } as ApiResponse & { nextCursor: string | null });
+  }
 
   const messages = await dbService.getMessages(
     sessionId,
@@ -89,6 +120,18 @@ router.get('/:sessionId', [
     timestamp: new Date().toISOString()
   } as ApiResponse);
 }));
+
+// Accepts ISO 8601, unix seconds, or unix milliseconds. Cursor pages keep
+// filtering on the original since value, so pass it on every page.
+function parseSince(raw: string | undefined): Date | null {
+  if (!raw) return new Date(0); // cursor without since: no lower bound
+  if (/^\d+$/.test(raw)) {
+    const n = parseInt(raw, 10);
+    return new Date(n < 1e12 ? n * 1000 : n);
+  }
+  const d = new Date(raw);
+  return isNaN(d.getTime()) ? null : d;
+}
 
 // ---------- Message delivery status (polling endpoints) ----------
 
@@ -293,9 +336,12 @@ router.get('/:sessionId/stuck', [
 router.post('/:sessionId/send', [
   param('sessionId').notEmpty(),
   body('to').notEmpty().trim(),
-  body('content.text').notEmpty().trim(),
+  // deletes carry no text; edits and plain sends must
+  body('content.text').if(body('options.delete').not().exists()).notEmpty().trim(),
   body('options.quoted').optional().isString(),
-  body('options.mentions').optional().isArray()
+  body('options.mentions').optional().isArray(),
+  body('options.edit').optional().isString(),
+  body('options.delete').optional().isString()
 ], sessionMiddleware, handleValidationErrors, asyncHandler(async (req, res) => {
   const { sessionId } = req.params;
   const { to, content, options = {} } = req.body;
@@ -309,6 +355,14 @@ router.post('/:sessionId/send', [
     
     if (options.mentions && options.mentions.length > 0) {
       messageContent.mentions = options.mentions;
+    }
+
+    if (options.edit) {
+      messageContent.edit = options.edit;
+    }
+
+    if (options.delete) {
+      messageContent.delete = options.delete;
     }
 
     const result = await whatsAppService.sendMessage(sessionId, to, messageContent);

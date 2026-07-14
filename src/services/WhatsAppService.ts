@@ -788,6 +788,12 @@ export class WhatsAppService {
     }
 
     const normalizedJid = this.normalizeJid(to);
+    if (typeof (content as any).delete === 'string') {
+      return await session.socket.sendMessage(normalizedJid, { delete: { remoteJid: normalizedJid, id: (content as any).delete, fromMe: true } as any });
+    }
+    if (typeof (content as any).edit === 'string') {
+      (content as any).edit = { remoteJid: normalizedJid, id: (content as any).edit, fromMe: true };
+    }
     return await session.socket.sendMessage(normalizedJid, content);
   }
 

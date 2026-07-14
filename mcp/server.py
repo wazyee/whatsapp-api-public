@@ -23,19 +23,31 @@ Notable upstream quirks this server papers over:
 * Rate limit is 100 requests per 15 minute window per IP across every
   endpoint. `get_chat_overview` is bounded to keep one composite call cheap.
 
+Runs in two modes:
+
+* **stdio** (default): one user, API key from env. `python server.py`
+* **streamable HTTP** (`--http`): hosted multi-user mode. Each request must
+  carry the caller's wapi key as `X-API-Key` (or `Authorization: Bearer`);
+  the key is scoped to that request via a contextvar. Bind host/port with
+  MCP_HTTP_HOST / MCP_HTTP_PORT (default 127.0.0.1:3002, put nginx in front).
+
 Config via env:
-    WHATSAPP_API_BASE         e.g. https://your-domain.com
-    WHATSAPP_API_KEY          X-API-Key for every request
-    WHATSAPP_DEFAULT_SESSION  session id used when a tool's `session` arg is None
+    WHATSAPP_API_BASE         e.g. https://your-domain.com (required)
+    WHATSAPP_API_KEY          X-API-Key (required in stdio mode only)
+    WHATSAPP_DEFAULT_SESSION  session id used when a tool's `session` arg is
+                              None; when unset, the single connected session
+                              of the calling key is auto-resolved
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import mimetypes
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,15 +59,57 @@ from pydantic import BaseModel, ConfigDict, Field
 API_BASE = os.environ.get("WHATSAPP_API_BASE", "").rstrip("/")
 API_KEY = os.environ.get("WHATSAPP_API_KEY", "")
 DEFAULT_SESSION = os.environ.get("WHATSAPP_DEFAULT_SESSION", "")
+HTTP_MODE = "--http" in sys.argv
 
-if not API_BASE or not API_KEY:
+if not API_BASE or (not API_KEY and not HTTP_MODE):
     sys.stderr.write(
-        "whatsapp_mcp: WHATSAPP_API_BASE and WHATSAPP_API_KEY must be set\n"
+        "whatsapp_mcp: WHATSAPP_API_BASE must be set"
+        " (and WHATSAPP_API_KEY in stdio mode)\n"
     )
     sys.exit(1)
 
+# stdio mode: one user, key from env. --http mode: the server is shared, the
+# key arrives per request and lives in a contextvar for that request only —
+# no cross-user leakage.
+_REQUEST_API_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "wapi_request_api_key", default=""
+)
 
-mcp = FastMCP("whatsapp_mcp")
+
+def _api_key() -> str:
+    key = _REQUEST_API_KEY.get() or API_KEY
+    if not key:
+        raise ValueError(
+            "No API key: send an X-API-Key header (HTTP) "
+            "or set WHATSAPP_API_KEY (stdio)"
+        )
+    return key
+
+
+from mcp.server.transport_security import TransportSecuritySettings
+
+# The SDK's DNS-rebinding protection rejects unknown Host headers. Behind
+# nginx the public hostname arrives here, so it must be allow-listed.
+_ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get(
+        "MCP_ALLOWED_HOSTS",
+        "127.0.0.1,localhost,127.0.0.1:3002,localhost:3002",
+    ).split(",")
+    if h.strip()
+]
+
+mcp = FastMCP(
+    "whatsapp_mcp",
+    host=os.environ.get("MCP_HTTP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_HTTP_PORT", "3002")),
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=_ALLOWED_HOSTS,
+        allowed_origins=[f"https://{h}" for h in _ALLOWED_HOSTS]
+        + [f"http://{h}" for h in _ALLOWED_HOSTS],
+    ),
+)
 
 # Module-level client gives us TCP/TLS connection reuse across tool calls.
 # Lazy so the test harness can import the module without opening sockets.
@@ -65,20 +119,57 @@ _CLIENT: Optional[httpx.AsyncClient] = None
 def _client() -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None or _CLIENT.is_closed:
+        # No auth header here — the key is per-request (multi-user HTTP mode),
+        # _request() attaches it. The pooled client is shared by all users.
         _CLIENT = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0),
-            headers={"X-API-Key": API_KEY, "Accept": "application/json"},
+            headers={"Accept": "application/json"},
         )
     return _CLIENT
 
 
-def _session(s: Optional[str]) -> str:
+# api-key -> (expires_at, sessionId); avoids one /api/sessions round-trip per
+# tool call for users who never pass `session` explicitly.
+_SESSION_CACHE: dict[str, tuple[float, str]] = {}
+
+
+async def _resolve_session(s: Optional[str]) -> str:
+    """Explicit param > env default > the user's single connected session.
+
+    The auto-resolve makes the hosted MCP zero-config for the common case
+    (one phone number). Users with several sessions get an actionable error
+    listing their session ids.
+    """
     sid = (s or DEFAULT_SESSION).strip()
-    if not sid:
-        raise ValueError(
-            "No session provided and WHATSAPP_DEFAULT_SESSION is unset"
-        )
-    return sid
+    if sid:
+        return sid
+
+    key = _api_key()
+    cached = _SESSION_CACHE.get(key)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    sessions = await _request("GET", "/api/sessions") or []
+    if not isinstance(sessions, list):
+        sessions = []
+    connected = [
+        x for x in sessions
+        if str(x.get("status") or "").upper() == "CONNECTED"
+    ]
+    pool = connected or sessions
+    if len(pool) == 1:
+        auto = str(pool[0].get("sessionId") or "").strip()
+        if auto:
+            _SESSION_CACHE[key] = (time.time() + 60.0, auto)
+            return auto
+
+    listing = ", ".join(
+        f"{x.get('sessionId')} ({x.get('status')})" for x in sessions
+    ) or "none"
+    raise ValueError(
+        "No session specified and no single connected session to default to. "
+        f"Available sessions: {listing}. Pass `session` explicitly."
+    )
 
 
 def _normalize_jid(raw: str) -> str:
@@ -129,6 +220,7 @@ async def _request(
         json=json_body,
         files=files,
         data=data,
+        headers={"X-API-Key": _api_key()},
         **kw,
     )
     resp.raise_for_status()
@@ -386,7 +478,7 @@ class SessionOnly(BaseModel):
     model_config = _BASE
     session: Optional[str] = Field(
         default=None,
-        description="Session id (e.g. 'my-session'). Falls back to WHATSAPP_DEFAULT_SESSION when omitted.",
+        description="Session id (e.g. 'mobile-lio'). Falls back to WHATSAPP_DEFAULT_SESSION when omitted.",
     )
 
 
@@ -437,6 +529,17 @@ class MessageIdInput(SessionOnly):
 class SendMessageInput(SessionOnly):
     to: str = Field(..., description="Recipient JID (groups end @g.us; individuals end @s.whatsapp.net). Bare phone numbers and @c.us are auto-normalized.", min_length=1)
     text: str = Field(..., description="Message body. Supports *bold*, _italic_, ~strike~, ```mono```, \\n line breaks, emojis.", min_length=1)
+
+
+class EditMessageInput(SessionOnly):
+    to: str = Field(..., description="Chat JID the original message was sent to.", min_length=1)
+    message_id: str = Field(..., description="ID of the previously sent message to edit (from send_message's response or get_messages). Only your own messages, within WhatsApp's ~15-minute edit window.", min_length=1)
+    text: str = Field(..., description="Replacement message body.", min_length=1)
+
+
+class DeleteMessageInput(SessionOnly):
+    to: str = Field(..., description="Chat JID the original message was sent to.", min_length=1)
+    message_id: str = Field(..., description="ID of the previously sent message to delete for everyone. Only your own messages.", min_length=1)
 
 
 class SendMediaInput(SessionOnly):
@@ -490,7 +593,7 @@ async def list_chats(params: ListChatsInput) -> str:
     `id`/`jid`, `name`, `isGroup`, `unreadCount`, `lastMessageTimestamp`).
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         chats = await _request(
             "GET",
             f"/api/chats/{sid}",
@@ -522,7 +625,7 @@ async def list_contacts(params: ListContactsInput) -> str:
     Returns JSON: { count, contacts: [{ id, jid, name, pushName, ... }] }
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         contacts = await _request("GET", f"/api/contacts/{sid}")
         if not isinstance(contacts, list):
             return _as_json({"count": 0, "contacts": contacts})
@@ -556,7 +659,7 @@ async def list_groups(params: SessionOnly) -> str:
     Returns JSON: { count, groups: [{ jid, name, participants, owner, creation }] }
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         groups = await _request("GET", f"/api/groups/{sid}/list-from-messages")
         return _as_json({
             "count": len(groups) if isinstance(groups, list) else 0,
@@ -591,7 +694,7 @@ async def get_messages(params: GetMessagesInput) -> str:
     Returns JSON: { chatId, scanned, returned, droppedProtocol, messages }
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         chat_id = _normalize_jid(params.chat_id)
         msgs = await _request(
             "GET",
@@ -675,7 +778,7 @@ async def get_chat_overview(params: GetChatOverviewInput) -> str:
     }
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         # Parallel fetch of the directory data — independent of messages paging.
         contacts_task = _request("GET", f"/api/contacts/{sid}")
         groups_task = _request("GET", f"/api/groups/{sid}/list-from-messages")
@@ -794,7 +897,7 @@ async def get_contact_presence(params: ContactIdInput) -> str:
     a side effect of the lookup.
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         jid = _normalize_jid(params.contact_id)
         data = await _request("GET", f"/api/contacts/{sid}/{jid}/presence")
         return _as_json(data)
@@ -815,7 +918,7 @@ async def get_contact_presence(params: ContactIdInput) -> str:
 async def get_contact_profile_picture(params: ContactIdInput) -> str:
     """Get the profile picture URL (or data) for a contact."""
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         jid = _normalize_jid(params.contact_id)
         data = await _request("GET", f"/api/contacts/{sid}/{jid}/profile-picture")
         return _as_json(data)
@@ -836,7 +939,7 @@ async def get_contact_profile_picture(params: ContactIdInput) -> str:
 async def get_message_status(params: MessageIdInput) -> str:
     """Get delivery state and transition timestamps for a message id."""
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         data = await _request(
             "GET", f"/api/messages/{sid}/by-id/{params.message_id}/status"
         )
@@ -861,7 +964,7 @@ async def get_session_status(params: SessionOnly) -> str:
     Useful as a pre-flight before queueing important sends.
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         data = await _request("GET", f"/api/sessions/{sid}/status")
         return _as_json(data)
     except Exception as e:
@@ -894,9 +997,72 @@ async def send_message(params: SendMessageInput) -> str:
         *bold*, _italic_, ~strikethrough~, ```monospace```, \\n for newlines.
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         to = _normalize_jid(params.to)
         body = {"to": to, "content": {"text": params.text}}
+        data = await _request("POST", f"/api/messages/{sid}/send", json_body=body)
+        return _as_json(_normalize_send_response(data))
+    except Exception as e:
+        return _format_error(e)
+
+
+@mcp.tool(
+    name="edit_message",
+    annotations={
+        "title": "Edit a sent WhatsApp message",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def edit_message(params: EditMessageInput) -> str:
+    """Edit a message you already sent (WhatsApp allows ~15 minutes).
+
+    Pass the chat JID and the message id returned by `send_message`
+    (`messageId` field) or found via `get_messages`. Only `fromMe`
+    messages can be edited; recipients see the edited text plus
+    WhatsApp's "edited" marker.
+    """
+    try:
+        sid = await _resolve_session(params.session)
+        to = _normalize_jid(params.to)
+        body = {
+            "to": to,
+            "content": {"text": params.text},
+            "options": {"edit": params.message_id},
+        }
+        data = await _request("POST", f"/api/messages/{sid}/send", json_body=body)
+        return _as_json(_normalize_send_response(data))
+    except Exception as e:
+        return _format_error(e)
+
+
+@mcp.tool(
+    name="delete_message",
+    annotations={
+        "title": "Delete a sent WhatsApp message for everyone",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def delete_message(params: DeleteMessageInput) -> str:
+    """Delete a message you sent, for everyone in the chat.
+
+    Pass the chat JID and the message id (from `send_message` /
+    `get_messages`). Only `fromMe` messages; recipients see
+    "This message was deleted".
+    """
+    try:
+        sid = await _resolve_session(params.session)
+        to = _normalize_jid(params.to)
+        body = {
+            "to": to,
+            "content": {},
+            "options": {"delete": params.message_id},
+        }
         data = await _request("POST", f"/api/messages/{sid}/send", json_body=body)
         return _as_json(_normalize_send_response(data))
     except Exception as e:
@@ -925,7 +1091,7 @@ async def send_media(params: SendMediaInput) -> str:
     standard video formats work fine.
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         path = Path(params.file_path)
         if not path.is_absolute():
             return f"Error: file_path must be absolute, got {params.file_path!r}"
@@ -970,7 +1136,7 @@ async def send_media(params: SendMediaInput) -> str:
 async def send_location(params: SendLocationInput) -> str:
     """Send a location card with lat/lng and optional name+address."""
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         to = _normalize_jid(params.to)
         body: dict[str, Any] = {
             "to": to,
@@ -1006,7 +1172,7 @@ async def send_reaction(params: SendReactionInput) -> str:
     empty string to remove an existing reaction.
     """
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         to = _normalize_jid(params.to)
         body = {
             "to": to,
@@ -1034,7 +1200,7 @@ async def send_reaction(params: SendReactionInput) -> str:
 async def mark_chat_read(params: MarkChatReadInput) -> str:
     """Mark all unread messages in a chat as read."""
     try:
-        sid = _session(params.session)
+        sid = await _resolve_session(params.session)
         chat_id = _normalize_jid(params.chat_id)
         data = await _request("POST", f"/api/chats/{sid}/{chat_id}/mark-read")
         return _as_json(data)
@@ -1042,5 +1208,36 @@ async def mark_chat_read(params: MarkChatReadInput) -> str:
         return _format_error(e)
 
 
+def _run_http() -> None:
+    """Hosted mode: streamable HTTP app behind nginx, per-request key auth."""
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    class ApiKeyMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            key = request.headers.get("x-api-key", "")
+            if not key:
+                auth = request.headers.get("authorization", "")
+                if auth.lower().startswith("bearer "):
+                    key = auth[7:].strip()
+            token = _REQUEST_API_KEY.set(key)
+            try:
+                return await call_next(request)
+            finally:
+                _REQUEST_API_KEY.reset(token)
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(ApiKeyMiddleware)
+    uvicorn.run(
+        app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=os.environ.get("MCP_HTTP_LOG_LEVEL", "info"),
+    )
+
+
 if __name__ == "__main__":
-    mcp.run()
+    if HTTP_MODE:
+        _run_http()
+    else:
+        mcp.run()

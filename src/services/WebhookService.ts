@@ -3,222 +3,194 @@ import crypto from 'crypto';
 import { DatabaseService } from './DatabaseService.js';
 import { webhookLogger } from '../Utils/apiLogger.js';
 
+// Retry state lives on the WebhookDelivery row (attempts / nextRetry / status),
+// never in memory: a process restart loses nothing, the periodic sweep picks
+// scheduled retries back up from the DB. The legacy per-Webhook `retries`
+// counter is informational only — it never gates delivery (it used to, and
+// permanently disabled a webhook after 3 failures ever).
+//
+// Delivery lifecycle:
+//   PENDING  -> created, first attempt in flight
+//   SUCCESS  -> receiver answered 2xx
+//   RETRYING -> transient failure (network/5xx/408/429), nextRetry scheduled
+//   FAILED   -> permanent 4xx, or attempts exhausted
+//
+// ponytail: single-process sweep (pm2 fork, instances=1); move claims into
+// SELECT ... FOR UPDATE SKIP LOCKED if this ever runs multi-instance.
+
+const RETRY_DELAYS_MS = [15_000, 60_000, 4 * 60_000, 10 * 60_000, 30 * 60_000];
+
+function maxAttempts(): number {
+  return parseInt(process.env.WEBHOOK_MAX_ATTEMPTS || '6', 10); // 1 initial + 5 retries
+}
+
+const SWEEP_INTERVAL_MS = 30_000;
+let sweepTimer: NodeJS.Timeout | null = null; // module-level: N service instances, one sweep
+
 export class WebhookService {
   private dbService: DatabaseService;
-  private retryQueue: Map<string, NodeJS.Timeout> = new Map();
 
   constructor() {
     this.dbService = new DatabaseService();
+    this.startSweeper();
   }
 
   async sendWebhook(sessionId: string, event: string, payload: any): Promise<void> {
     try {
-      // Get session to find user
       const session = await this.dbService.getSession(sessionId);
       if (!session) {
         webhookLogger.warn(`Session ${sessionId} not found for webhook`);
         return;
       }
 
-      // Get user's webhooks for this event
       const webhooks = await this.dbService.getUserWebhooks(session.userId);
-      const relevantWebhooks = webhooks.filter(webhook => 
+      const relevantWebhooks = webhooks.filter(webhook =>
         webhook.events.includes(event) || webhook.events.includes('*')
       );
 
-      // Send to each webhook
       for (const webhook of relevantWebhooks) {
-        await this.deliverWebhook(webhook.id, webhook.url, event, payload, webhook.secret ?? undefined);
+        const delivery = await this.dbService.client.webhookDelivery.create({
+          data: { webhookId: webhook.id, event, payload, status: 'PENDING' }
+        });
+        await this.attempt(delivery.id);
       }
     } catch (error) {
       webhookLogger.error('Error sending webhooks:', error);
     }
   }
 
-  private async deliverWebhook(
-    webhookId: string,
-    url: string,
-    event: string,
-    payload: any,
-    secret?: string
-  ): Promise<void> {
+  // One delivery attempt. Reads everything it needs from the DB so it can be
+  // called from the live path, the sweep, and replay alike.
+  private async attempt(deliveryId: string): Promise<void> {
+    const delivery = await this.dbService.client.webhookDelivery.findUnique({
+      where: { id: deliveryId },
+      include: { webhook: true }
+    });
+    if (!delivery || delivery.status === 'SUCCESS') return;
+
+    const { webhook } = delivery;
+    const webhookPayload = {
+      event: delivery.event,
+      timestamp: new Date().toISOString(),
+      data: delivery.payload
+    };
+
+    const headers: any = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Baileys-API-Webhook/1.0'
+    };
+    if (webhook.secret) {
+      headers['X-Webhook-Signature'] = this.createSignature(JSON.stringify(webhookPayload), webhook.secret);
+    }
+
+    let response: AxiosResponse | null = null;
+    let errorMessage = '';
     try {
-      // Create delivery record
-      const delivery = await this.dbService.client.webhookDelivery.create({
-        data: {
-          webhookId,
-          event,
-          payload,
-          status: 'PENDING'
-        }
-      });
-
-      // Prepare webhook payload
-      const webhookPayload = {
-        event,
-        timestamp: new Date().toISOString(),
-        data: payload
-      };
-
-      // Create signature if secret is provided
-      const headers: any = {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Baileys-API-Webhook/1.0'
-      };
-
-      if (secret) {
-        const signature = this.createSignature(JSON.stringify(webhookPayload), secret);
-        headers['X-Webhook-Signature'] = signature;
-      }
-
-      // Send webhook
-      const response = await axios.post(url, webhookPayload, {
+      response = await axios.post(webhook.url, webhookPayload, {
         headers,
         timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000'),
-        validateStatus: (status) => status < 500 // Don't throw on 4xx errors
+        validateStatus: () => true // classify below, never throw on HTTP status
       });
-
-      // Update delivery record
-      await this.updateDeliveryStatus(delivery.id, response);
-
-      webhookLogger.info(`Webhook delivered successfully`, {
-        webhookId,
-        url,
-        event,
-        status: response.status,
-        deliveryId: delivery.id
-      });
-
-    } catch (error) {
-      webhookLogger.error(`Webhook delivery failed`, {
-        webhookId,
-        url,
-        event,
-        error: error.message
-      });
-
-      // Handle retry logic
-      await this.handleWebhookError(webhookId, url, event, payload, secret, error);
+    } catch (error: any) {
+      errorMessage = error?.message || 'network error';
     }
-  }
 
-  private async updateDeliveryStatus(
-    deliveryId: string,
-    response: AxiosResponse
-  ): Promise<void> {
-    const status = response.status >= 200 && response.status < 300 ? 'SUCCESS' : 'FAILED';
-    
+    const attempts = delivery.attempts + 1;
+    const responseSnapshot = response
+      ? JSON.stringify({ status: response.status, statusText: response.statusText, data: response.data })
+      : JSON.stringify({ error: errorMessage });
+
+    if (response && response.status >= 200 && response.status < 300) {
+      await this.dbService.client.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: { status: 'SUCCESS', attempts, nextRetry: null, response: responseSnapshot }
+      });
+      webhookLogger.info('Webhook delivered', {
+        webhookId: webhook.id, url: webhook.url, event: delivery.event, attempts, deliveryId
+      });
+      return;
+    }
+
+    // Permanent: receiver actively rejected (bad signature/config). 408/429 are transient.
+    const status = response?.status ?? 0;
+    const permanent = status >= 400 && status < 500 && status !== 408 && status !== 429;
+    const exhausted = attempts >= maxAttempts();
+
+    if (permanent || exhausted) {
+      await this.dbService.client.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: { status: 'FAILED', attempts, nextRetry: null, response: responseSnapshot }
+      });
+      await this.dbService.client.webhook.update({
+        where: { id: webhook.id },
+        data: { retries: { increment: 1 }, lastError: errorMessage || `HTTP ${status}` }
+      }).catch(() => {});
+      webhookLogger.warn('Webhook delivery failed permanently', {
+        webhookId: webhook.id, url: webhook.url, event: delivery.event, attempts, status, permanent
+      });
+      return;
+    }
+
+    const delay = RETRY_DELAYS_MS[Math.min(attempts - 1, RETRY_DELAYS_MS.length - 1)];
     await this.dbService.client.webhookDelivery.update({
       where: { id: deliveryId },
       data: {
-        status: status as any,
-        response: JSON.stringify({
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers,
-          data: response.data
-        }),
-        attempts: { increment: 1 }
+        status: 'RETRYING',
+        attempts,
+        nextRetry: new Date(Date.now() + delay),
+        response: responseSnapshot
       }
+    });
+    webhookLogger.info('Webhook retry scheduled', {
+      webhookId: webhook.id, url: webhook.url, event: delivery.event, attempts, retryInMs: delay
     });
   }
 
-  private async handleWebhookError(
-    webhookId: string,
-    url: string,
-    event: string,
-    payload: any,
-    secret?: string,
-    error?: any
-  ): Promise<void> {
-    try {
-      // Get webhook configuration
-      const webhook = await this.dbService.client.webhook.findUnique({
-        where: { id: webhookId }
-      });
+  // DB-driven retry engine: every 30s re-attempt due RETRYING deliveries and
+  // adopt PENDING orphans older than 2 minutes (process died mid-attempt).
+  private startSweeper(): void {
+    if (sweepTimer) return;
+    sweepTimer = setInterval(() => {
+      this.sweep().catch(err => webhookLogger.error('Webhook sweep error:', err));
+    }, SWEEP_INTERVAL_MS);
+    sweepTimer.unref();
+    // Immediate boot sweep so restarts resume without waiting an interval.
+    this.sweep().catch(err => webhookLogger.error('Webhook boot sweep error:', err));
+  }
 
-      if (!webhook) return;
+  private async sweep(): Promise<void> {
+    const now = new Date();
+    const due = await this.dbService.client.webhookDelivery.findMany({
+      where: {
+        OR: [
+          { status: 'RETRYING', nextRetry: { lte: now } },
+          { status: 'PENDING', createdAt: { lt: new Date(now.getTime() - 2 * 60_000) } }
+        ]
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 50,
+      select: { id: true }
+    });
 
-      // Update webhook error count
-      await this.dbService.client.webhook.update({
-        where: { id: webhookId },
-        data: {
-          retries: { increment: 1 },
-          lastError: error?.message || 'Unknown error'
-        }
-      });
-
-      // Check if we should retry
-      if (webhook.retries < webhook.maxRetries) {
-        const retryDelay = this.calculateRetryDelay(webhook.retries);
-        
-        webhookLogger.info(`Scheduling webhook retry`, {
-          webhookId,
-          url,
-          event,
-          retryCount: webhook.retries + 1,
-          retryDelay
-        });
-
-        // Schedule retry
-        const timeoutId = setTimeout(() => {
-          this.deliverWebhook(webhookId, url, event, payload, secret);
-          this.retryQueue.delete(webhookId);
-        }, retryDelay);
-
-        this.retryQueue.set(webhookId, timeoutId);
-
-        // Update delivery record with retry info
-        const delivery = await this.dbService.client.webhookDelivery.findFirst({
-          where: { webhookId, event, status: 'PENDING' },
-          orderBy: { createdAt: 'desc' }
-        });
-
-        if (delivery) {
-          await this.dbService.client.webhookDelivery.update({
-            where: { id: delivery.id },
-            data: {
-              status: 'RETRYING',
-              nextRetry: new Date(Date.now() + retryDelay),
-              attempts: { increment: 1 }
-            }
-          });
-        }
-      } else {
-        webhookLogger.warn(`Webhook max retries exceeded`, {
-          webhookId,
-          url,
-          event,
-          maxRetries: webhook.maxRetries
-        });
-
-        // Mark delivery as failed
-        const delivery = await this.dbService.client.webhookDelivery.findFirst({
-          where: { webhookId, event, status: { in: ['PENDING', 'RETRYING'] } },
-          orderBy: { createdAt: 'desc' }
-        });
-
-        if (delivery) {
-          await this.dbService.client.webhookDelivery.update({
-            where: { id: delivery.id },
-            data: {
-              status: 'FAILED',
-              response: JSON.stringify({
-                error: error?.message || 'Max retries exceeded'
-              })
-            }
-          });
-        }
-      }
-    } catch (retryError) {
-      webhookLogger.error('Error handling webhook retry:', retryError);
+    for (const { id } of due) {
+      await this.attempt(id);
     }
   }
 
-  private calculateRetryDelay(retryCount: number): number {
-    // Exponential backoff: 2^retryCount seconds, max 5 minutes
-    const delay = Math.min(Math.pow(2, retryCount) * 1000, 5 * 60 * 1000);
-    return delay;
+  // Re-enqueue every delivery of a webhook created since `since` (downtime
+  // recovery). Payloads are persisted on the delivery rows, so this re-sends
+  // the original events. Resets attempts; the sweep does the actual sending.
+  async replayDeliveries(webhookId: string, since: Date): Promise<number> {
+    const result = await this.dbService.client.webhookDelivery.updateMany({
+      where: {
+        webhookId,
+        createdAt: { gte: since },
+        status: { in: ['SUCCESS', 'FAILED', 'RETRYING'] }
+      },
+      data: { status: 'RETRYING', attempts: 0, nextRetry: new Date() }
+    });
+    webhookLogger.info('Webhook replay enqueued', { webhookId, since: since.toISOString(), count: result.count });
+    return result.count;
   }
 
   private createSignature(payload: string, secret: string): string {
@@ -295,45 +267,15 @@ export class WebhookService {
     });
   }
 
-  async retryFailedDeliveries(webhookId: string): Promise<number> {
-    const failedDeliveries = await this.dbService.client.webhookDelivery.findMany({
-      where: {
-        webhookId,
-        status: 'FAILED'
-      },
-      include: {
-        webhook: true
-      }
-    });
-
-    let retriedCount = 0;
-
-    for (const delivery of failedDeliveries) {
-      if (delivery.webhook.retries < delivery.webhook.maxRetries) {
-        await this.deliverWebhook(
-          webhookId,
-          delivery.webhook.url,
-          delivery.event,
-          delivery.payload,
-          delivery.webhook.secret || undefined
-        );
-        retriedCount++;
-      }
-    }
-
-    return retriedCount;
-  }
-
   async cleanup(): Promise<void> {
-    // Clear retry timeouts
-    for (const [webhookId, timeoutId] of this.retryQueue) {
-      clearTimeout(timeoutId);
+    if (sweepTimer) {
+      clearInterval(sweepTimer);
+      sweepTimer = null;
     }
-    this.retryQueue.clear();
 
     // Clean up old delivery records (older than 30 days)
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    
+
     await this.dbService.client.webhookDelivery.deleteMany({
       where: {
         createdAt: {

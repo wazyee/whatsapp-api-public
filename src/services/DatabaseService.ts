@@ -315,6 +315,23 @@ export class DatabaseService {
     });
   }
 
+  // Incremental sync: everything created OR updated (status changes) since a
+  // point in time, oldest-first, stable across inserts. First page filters on
+  // updatedAt >= since; follow-up pages resume from the opaque cursor (row id)
+  // so equal-timestamp runs can never loop or skip.
+  async getMessagesSince(sessionId: string, since: Date, chatId?: string, limit = 100, cursor?: string) {
+    return this.prisma.message.findMany({
+      where: {
+        sessionId,
+        ...(chatId && { chatId }),
+        updatedAt: { gte: since }
+      },
+      orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+      take: limit,
+      ...(cursor && { cursor: { id: cursor }, skip: 1 })
+    });
+  }
+
   // Chat operations
   async upsertChat(data: {
     sessionId: string;

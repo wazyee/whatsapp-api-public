@@ -79,6 +79,7 @@ model Message {
 
   @@unique([sessionId, messageId])
   @@index([sessionId, status, timestamp])
+  @@index([sessionId, updatedAt])
   @@map("messages")
 }
 
@@ -175,6 +176,7 @@ model WebhookDelivery {
   webhookId String
   webhook   Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
 
+  @@index([status, nextRetry])
   @@map("webhook_deliveries")
 }
 

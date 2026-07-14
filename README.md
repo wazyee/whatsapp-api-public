@@ -108,11 +108,81 @@ curl -X POST https://your-domain.com/api/messages/my-session/send \
 
 Full API reference: `https://your-domain.com/api-docs` (Swagger UI). More recipes in [QUICK_START_GUIDE.md](QUICK_START_GUIDE.md) and [USER_MANAGEMENT.md](USER_MANAGEMENT.md).
 
+### Reliability features
+
+**Incremental sync (`since` cursor).** Instead of offset-paginating, clients can pull everything new since their last sync — including delivery-status updates (filtering is on `updatedAt`):
+
+```bash
+curl "https://your-domain.com/api/messages/<sessionId>?since=2026-01-01T00:00:00Z&limit=100" \
+  -H "X-API-Key: <key>"
+# → { data: [...oldest first...], nextCursor: "..." }
+# follow-up pages: &cursor=<nextCursor> (keep the same since=)
+```
+
+`since` accepts ISO 8601 or unix epoch (seconds or ms). Pagination is stable (id tiebreak), so equal timestamps can never loop or skip.
+
+**Durable webhook delivery.** Webhook retry state is persisted per delivery (not in memory): transient failures (network, 5xx, 408, 429) are retried with backoff — 15s, 1m, 4m, 10m, 30m — up to `WEBHOOK_MAX_ATTEMPTS` (default 6, includes the first try). A 30s DB sweep drives retries, so restarts lose nothing. Permanent 4xx fail fast.
+
+**Webhook replay.** If your receiver was down, re-deliver everything recorded since a timestamp:
+
+```bash
+curl -X POST "https://your-domain.com/api/webhooks/<webhookId>/replay?since=2026-01-01T00:00:00Z" \
+  -H "X-API-Key: <key>"
+# → { replayed: <count> }   (defaults to the last 24h without since)
+```
+
+**Edit & delete sent messages.** `POST /api/messages/{sessionId}/send` accepts `options.edit` / `options.delete` with the original message id:
+
+```bash
+# edit (WhatsApp allows ~15 minutes)
+-d '{"to":"...","content":{"text":"corrected text"},"options":{"edit":"<messageId>"}}'
+# delete for everyone
+-d '{"to":"...","content":{},"options":{"delete":"<messageId>"}}'
+```
+
 ## 3. MCP server (Claude integration)
 
-`mcp/server.py` is a stdio MCP server that wraps this API — gives Claude tools like `get_chat_overview`, `get_messages`, `send_message`, `send_media`, `send_reaction`.
+`mcp/server.py` is an MCP server that wraps this API — gives Claude tools like `get_chat_overview`, `get_messages`, `send_message`, `edit_message`, `delete_message`, `send_media`, `send_reaction`.
 
-### Setup
+It runs in two modes: **hosted (streamable HTTP)** — deploy it once next to the API and every user connects with a single command — or **local (stdio)** — each user runs their own copy.
+
+### Option A — hosted (recommended: zero install for users)
+
+Run the MCP server on the same box as the API:
+
+```bash
+cd mcp
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+WHATSAPP_API_BASE=http://127.0.0.1:3001 \
+MCP_ALLOWED_HOSTS=your-domain.com,127.0.0.1,localhost,127.0.0.1:3002,localhost:3002 \
+.venv/bin/python server.py --http   # listens on 127.0.0.1:3002
+```
+
+(Or manage it with pm2 — see `ecosystem.config.cjs` for a template.) Then proxy it in nginx:
+
+```nginx
+# streamable HTTP = SSE responses: no buffering
+location /mcp {
+    proxy_pass http://127.0.0.1:3002;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+}
+```
+
+Every user now connects with one command — no Python, no clone:
+
+```bash
+claude mcp add --transport http whatsapp https://your-domain.com/mcp \
+  --header "X-API-Key: <your apiKey>"
+```
+
+Auth is per request: each user sends their own API key (`X-API-Key` or `Authorization: Bearer`), so one hosted MCP serves all users of the deployment with strict per-user scoping. If a user has exactly one connected WhatsApp session, it is auto-selected; multiple sessions → pass `session` in tool calls (or set `WHATSAPP_DEFAULT_SESSION` locally).
+
+### Option B — local (stdio)
 
 ```bash
 cd mcp
