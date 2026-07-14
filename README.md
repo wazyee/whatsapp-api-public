@@ -180,7 +180,7 @@ claude mcp add --transport http whatsapp https://your-domain.com/mcp \
   --header "X-API-Key: <your apiKey>"
 ```
 
-Auth is per request: each user sends their own API key (`X-API-Key` or `Authorization: Bearer`), so one hosted MCP serves all users of the deployment with strict per-user scoping. If a user has exactly one connected WhatsApp session, it is auto-selected; multiple sessions → pass `session` in tool calls (or set `WHATSAPP_DEFAULT_SESSION` locally).
+Auth is per request: each user sends their own API key (`X-API-Key` or `Authorization: Bearer`), so one hosted MCP serves all users of the deployment with strict per-user scoping. One caveat: `send_media` reads `file_path` from the filesystem the MCP server runs on — for sending local files, use the stdio mode below (everything else works identically). If a user has exactly one connected WhatsApp session, it is auto-selected; multiple sessions → pass `session` in tool calls (or set `WHATSAPP_DEFAULT_SESSION` locally).
 
 ### Option B — local (stdio)
 
